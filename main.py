@@ -1,299 +1,260 @@
 import rlgym
-from rlgym import make
-from rlgym.utils.reward_functions import DefaultReward
+from rlgym.utils.reward_functions import RewardFunction
 from rlgym.utils.state_setters import DefaultState
 from rlgym.utils.obs_builders import DefaultObs
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-
-from stable_baselines3 import PPO
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.env_util import make_vec_env
-
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-import lightgbm as lgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-
-import optuna
-
-from tensorboardX import SummaryWriter  # Use tensorboardX instead
-
+import matplotlib.pyplot as plt
 import numpy as np
-import os
-import pickle
 
-# 1. Définition des Conditions de Terminaison Personnalisées
-from rlgym.utils import BaseTerminationCondition
-
-class CustomTimeoutCondition(BaseTerminationCondition):
-    def __init__(self, timeout=300):
-        self.timeout = timeout
+# 1. Custom Reward Function (Only Positive Rewards)
+class CustomRewardFunction(RewardFunction):
+    def __init__(self):
+        super().__init__()
 
     def reset(self, initial_state):
-        self.current_step = 0
+        # Initialize previous touch and goal counts
+        self.prev_touch = {player: 0 for player in initial_state.players}
+        self.prev_goal = {team: 0 for team in ['Blue', 'Orange']}
 
-    def is_terminal(self, state):
-        self.current_step += 1
-        return self.current_step >= self.timeout
+    def get_reward(self, state, previous_state, done=False):
+        rewards = {player: 0.0 for player in state.players}
 
-class CustomGoalScoredCondition(BaseTerminationCondition):
-    def is_terminal(self, state):
-        # Exemple simple : terminer si un but est marqué
-        # Vous devrez adapter cette condition en fonction des attributs de 'state'
-        # Par exemple, si 'state' contient les informations sur les buts, ajustez en conséquence
-        # L'exemple ci-dessous est fictif et doit être adapté
-        # Remplacez 'state.ball.position[0] > 1000' par une condition réelle basée sur l'état
-        return state.ball.position[0] > 1000  # Exemple fictif
+        # Encourage touching the ball
+        for player in state.players:
+            if state.players[player].touch_count > self.prev_touch[player]:
+                rewards[player] += 1.0  # Reward for touching the ball
+                self.prev_touch[player] = state.players[player].touch_count
 
-# 2. Configuration de l'Environnement rlgym
+        # Encourage scoring goals
+        for team in ['Blue', 'Orange']:
+            if state.score_info.goals_scored[team] > self.prev_goal[team]:
+                for player in state.players:
+                    if state.players[player].team == team:
+                        rewards[player] += 5.0  # Reward for scoring a goal
+                self.prev_goal[team] = state.score_info.goals_scored[team]
+
+        return rewards
+
+# 2. Actor-Critic Network (Simple MLP)
+class ActorCritic(nn.Module):
+    def __init__(self, input_dim, action_dim):
+        super(ActorCritic, self).__init__()
+        # Define the network architecture
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        # Policy head
+        self.policy = nn.Linear(256, action_dim)
+        # Value head
+        self.value = nn.Linear(256, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.policy(x), self.value(x)
+
+    def get_action(self, state):
+        logits, value = self.forward(state)
+        mean = torch.tanh(logits)  # Assuming actions are continuous and normalized
+        std = torch.ones_like(mean) * 0.1  # Fixed standard deviation
+        dist = torch.distributions.Normal(mean, std)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        return action.detach().numpy(), log_prob.item()
+
+# 3. PPO Agent
+class PPOAgent:
+    def __init__(self, input_dim, action_dim, lr=3e-4, gamma=0.99, eps_clip=0.2, k_epochs=4):
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.k_epochs = k_epochs
+
+        self.actor_critic = ActorCritic(input_dim, action_dim)
+        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=lr)
+        self.mse_loss = nn.MSELoss()
+
+    def compute_returns(self, rewards, dones, next_value):
+        returns = []
+        G = next_value
+        for reward, done in zip(reversed(rewards), reversed(dones)):
+            G = reward + (1 - done) * self.gamma * G
+            returns.insert(0, G)
+        return torch.tensor(returns, dtype=torch.float32)
+
+    def train_agent(self, states, actions, log_probs, rewards, dones, next_value):
+        returns = self.compute_returns(rewards, dones, next_value)
+        returns = returns.detach()
+
+        states = torch.cat(states, dim=0)  # [batch, input_dim]
+        actions = torch.stack(actions, dim=0)  # [batch, action_dim]
+        old_log_probs = torch.tensor(log_probs, dtype=torch.float32)  # [batch]
+
+        for _ in range(self.k_epochs):
+            logits, values = self.actor_critic(states)
+            mean = torch.tanh(logits)
+            std = torch.ones_like(mean) * 0.1
+            dist = torch.distributions.Normal(mean, std)
+
+            new_log_probs = dist.log_prob(actions).sum(dim=-1)
+            ratios = torch.exp(new_log_probs - old_log_probs)
+            advantages = (returns - values.squeeze()).detach()
+
+            # PPO Clipping
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            loss_policy = -torch.min(surr1, surr2).mean()
+            loss_value = self.mse_loss(values.squeeze(), returns)
+            loss = loss_policy + 0.5 * loss_value
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+    def save_model(self, path):
+        torch.save(self.actor_critic.state_dict(), path)
+
+    def load_model(self, path):
+        self.actor_critic.load_state_dict(torch.load(path))
+        self.actor_critic.eval()
+
+# 4. Create Environment with Self-Play (2v2)
 def create_rlgym_env():
-    env = make(
-        reward_fn=DefaultReward(),
-        terminal_conditions=[CustomTimeoutCondition(timeout=300), CustomGoalScoredCondition()],
+    return rlgym.make(
+        reward_fn=CustomRewardFunction(),
+        terminal_conditions=[],  # Add custom terminal conditions if necessary
         state_setter=DefaultState(),
-        obs_builder=DefaultObs()
+        obs_builder=DefaultObs(),
+        team_size=2,  # 2 agents per team (total 4 agents)
+        tick_skip=8
     )
-    return env
 
-# 3. Définition des Modèles Individuels
-# 3.1 CNN Feature Extractor
-class CNNFeatureExtractor(nn.Module):
-    def __init__(self, input_channels):
-        super(CNNFeatureExtractor, self).__init__()
-        self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.flatten = nn.Flatten()
-        self.fc = nn.Linear(64 * 7 * 7, 512)  # Ajustez selon la taille de l'entrée
+# 5. Training Function with Self-Play
+def train_agent(num_episodes=500, max_timesteps=200, save_path="ppo_optimized_agent.pth"):
+    env = create_rlgym_env()
 
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = self.flatten(x)
-        x = F.relu(self.fc(x))
-        return x
+    # Get observation and action dimensions
+    obs_space = env.observation_space
+    action_space = env.action_space
 
-# 3.2 Mécanisme d'Attention (Transformers)
-class AttentionModule(nn.Module):
-    def __init__(self, feature_dim, num_heads=8):
-        super(AttentionModule, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads, batch_first=True)
-        self.fc = nn.Linear(feature_dim, feature_dim)
+    # Verify observation shape
+    print(f"Observation space shape: {obs_space.shape}")
 
-    def forward(self, x):
-        # x: [batch_size, seq_length, feature_dim]
-        attn_output, _ = self.attention(x, x, x)
-        x = F.relu(self.fc(attn_output))
-        return x
+    # Assume observation is a vector of size N
+    if len(obs_space.shape) == 1:
+        input_dim = obs_space.shape[0]
+    else:
+        # Adjust based on actual observation shape
+        input_dim = np.prod(obs_space.shape)
 
-# 3.3 Modèles Secondaires (Random Forests, LightGBM, SVM)
-class SecondaryModels:
-    def __init__(self):
-        self.rf = RandomForestClassifier(n_estimators=100, random_state=42)
-        self.lgbm = lgb.LGBMClassifier(n_estimators=100, random_state=42)
-        self.svm = SVC(probability=True, random_state=42)
-    
-    def train(self, X, y):
-        self.rf.fit(X, y)
-        self.lgbm.fit(X, y)
-        self.svm.fit(X, y)
-    
-    def predict_proba(self, X):
-        rf_preds = self.rf.predict_proba(X)
-        lgbm_preds = self.lgbm.predict_proba(X)
-        svm_preds = self.svm.predict_proba(X)
-        # Combiner les prédictions par moyenne
-        combined_preds = (rf_preds + lgbm_preds + svm_preds) / 3
-        return combined_preds
+    action_dim = action_space.shape[0]
+    # Assuming continuous action space with dimension 'action_dim'
 
-# 4. Agent Hybride avec Ensemble Learning
-class HybridAgent(nn.Module):
-    def __init__(self, input_channels, num_actions):
-        super(HybridAgent, self).__init__()
-        self.cnn = CNNFeatureExtractor(input_channels)
-        self.attention = AttentionModule(feature_dim=512)
-        self.fc = nn.Linear(512, num_actions)
-        self.secondary_models = SecondaryModels()
-    
-    def forward(self, x):
-        features = self.cnn(x)
-        # Ajouter une dimension de séquence pour le Transformer
-        features = features.unsqueeze(1)  # [batch_size, 1, feature_dim]
-        attention_out = self.attention(features).squeeze(1)  # [batch_size, feature_dim]
-        action_logits = self.fc(attention_out)
-        return action_logits
-    
-    def train_secondary_models(self, X, y):
-        self.secondary_models.train(X, y)
-    
-    def predict_secondary_models(self, X):
-        return self.secondary_models.predict_proba(X)
+    agent = PPOAgent(input_dim=input_dim, action_dim=action_dim)
+    rewards_per_episode = []
 
-# 5. Knowledge Distillation
-class StudentModel(nn.Module):
-    def __init__(self, input_channels, num_actions):
-        super(StudentModel, self).__init__()
-        self.cnn = CNNFeatureExtractor(input_channels)
-        self.fc = nn.Linear(512, num_actions)
-    
-    def forward(self, x):
-        features = self.cnn(x)
-        action_logits = self.fc(features)
-        return action_logits
+    for episode in range(num_episodes):
+        states = env.reset()
+        # Ensure states is a list
+        if not isinstance(states, list) and not isinstance(states, tuple):
+            states = [states]
+        num_agents = len(states)
+        # Flatten states and convert to tensors
+        state_tensors = []
+        for state in states:
+            state = np.array(state, dtype=np.float32)
+            state_tensor = torch.from_numpy(state).unsqueeze(0)  # [1, input_dim]
+            state_tensors.append(state_tensor)
 
-def knowledge_distillation(student, teacher, dataloader, optimizer, criterion, device):
-    student.train()
-    teacher.eval()
-    for batch in dataloader:
-        inputs, _ = batch
-        inputs = inputs.to(device)
-        with torch.no_grad():
-            teacher_outputs = teacher(inputs)
-        student_outputs = student(inputs)
-        loss = criterion(student_outputs, teacher_outputs)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-# 6. Hyperparameter Tuning avec Optuna
-def evaluate_agent(agent, env, num_episodes=10):
-    all_rewards = []
-    for _ in range(num_episodes):
-        obs = env.reset()
-        done = False
+        log_probs_combined = []
+        actions_combined = []
+        rewards_combined = []
+        dones_combined = []
         total_reward = 0
-        while not done:
-            action, _ = agent.predict(obs)
-            obs, reward, done, info = env.step(action)
-            total_reward += reward
-        all_rewards.append(total_reward)
-    return np.mean(all_rewards)
 
-def optimize_agent(trial):
-    # Hyperparamètres à optimiser
-    learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 1e-3)
-    n_steps = trial.suggest_int('n_steps', 128, 2048)
-    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
-    gamma = trial.suggest_uniform('gamma', 0.8, 0.9999)
-    ent_coef = trial.suggest_loguniform('ent_coef', 1e-8, 1e-2)
-    
-    # Créer l'environnement vectorisé
-    vec_env = make_vec_env(lambda: create_rlgym_env(), n_envs=4)
-    
-    # Définir les paramètres du modèle PPO
-    policy_kwargs = dict(
-        features_extractor_class=CustomHybridExtractor,
-        features_extractor_kwargs=dict(features_dim=512),
-        activation_fn=nn.ReLU,
-    )
-    
-    # Instancier l'agent PPO avec notre modèle hybride
-    agent = PPO(
-        "CnnPolicy",
-        vec_env,
-        policy_kwargs=policy_kwargs,
-        verbose=0,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        gamma=gamma,
-        ent_coef=ent_coef,
-        tensorboard_log="./ppo_rlgym_tensorboard/"
-    )
-    
-    # Entraîner l'agent
-    agent.learn(total_timesteps=50000)  # Ajustez selon vos ressources
-    
-    # Évaluer l'agent
-    mean_reward = evaluate_agent(agent, vec_env)
-    
-    # Nettoyage
-    vec_env.close()
-    
-    return mean_reward
+        for t in range(max_timesteps):
+            actions = []
+            log_probs = []
+            for i in range(num_agents):
+                action, log_prob = agent.actor_critic.get_action(state_tensors[i])
+                actions.append(action)  # [action_dim] as numpy array
+                log_probs.append(log_prob)
 
-# 7. Surveillance des Performances avec TensorBoard
-def setup_tensorboard(log_dir):
-    writer = SummaryWriter(log_dir=log_dir)
-    return writer
+            # Pass actions as list of [action_dim] numpy arrays
+            next_states, rewards, dones, _ = env.step(actions)
 
-def log_metrics(writer, step, metrics):
-    for key, value in metrics.items():
-        writer.add_scalar(key, value, step)
+            # Reshape next states
+            if not isinstance(next_states, list) and not isinstance(next_states, tuple):
+                next_states = [next_states]
 
-# 8. Définir l'Extracteur de Caractéristiques Personnalisé
-class CustomHybridExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=512):
-        super(CustomHybridExtractor, self).__init__(observation_space, features_dim)
-        self.cnn = CNNFeatureExtractor(input_channels=observation_space.shape[0])
-        self.attention = AttentionModule(feature_dim=512)
-        self.flatten = nn.Flatten()
-        self.fc = nn.Linear(512, features_dim)
-    
-    def forward(self, observations):
-        x = self.cnn(observations)
-        x = x.unsqueeze(1)  # [batch_size, 1, feature_dim]
-        x = self.attention(x)
-        x = x.squeeze(1)  # [batch_size, feature_dim]
-        x = self.fc(x)
-        return x
+            next_state_tensors = []
+            for state in next_states:
+                state = np.array(state, dtype=np.float32)
+                state_tensor = torch.from_numpy(state).unsqueeze(0)  # [1, input_dim]
+                next_state_tensors.append(state_tensor)
 
-# 9. Fonction Principale
+            # Collect logs and actions
+            log_probs_combined.extend(log_probs)
+            actions_combined.extend([torch.from_numpy(a).float() for a in actions])
+            if isinstance(rewards, (list, tuple)):
+                rewards_combined.extend(rewards)
+            else:
+                rewards_combined.append(rewards)
+            if isinstance(dones, (list, tuple)):
+                dones_combined.extend(dones)
+            else:
+                dones_combined.append(dones)
+
+            state_tensors = next_state_tensors
+            if isinstance(rewards, (list, tuple)):
+                total_reward += sum(rewards)
+            else:
+                total_reward += rewards
+
+            # Handle 'dones' being a single bool or a list
+            if isinstance(dones, (list, tuple)):
+                done_flag = any(dones)
+            else:
+                done_flag = dones
+
+            if done_flag:
+                break
+
+        # Calculate next_value
+        with torch.no_grad():
+            next_values = []
+            for i in range(num_agents):
+                _, value = agent.actor_critic(state_tensors[i])
+                next_values.append(value.item())
+            next_value = sum(next_values)
+
+        # Train the agent
+        agent.train_agent(
+            states=state_tensors,
+            actions=actions_combined,
+            log_probs=log_probs_combined,
+            rewards=rewards_combined,
+            dones=dones_combined,
+            next_value=next_value
+        )
+
+        rewards_per_episode.append(total_reward)
+        print(f"Episode {episode + 1}, Total Reward: {total_reward}")
+
+    agent.save_model(save_path)
+
+    plt.plot(rewards_per_episode)
+    plt.xlabel("Episodes")
+    plt.ylabel("Total Reward")
+    plt.title("PPO Agent Performance with Self-Play (2v2)")
+    plt.show()
+
+    env.close()
+
+# 6. Main Function
 def main():
-    # Configuration de TensorBoard
-    log_dir = "./ppo_rlgym_tensorboard/"
-    writer = setup_tensorboard(log_dir)
-    
-    # Optimisation des hyperparamètres avec Optuna
-    study = optuna.create_study(direction='maximize')
-    study.optimize(optimize_agent, n_trials=20)
-    
-    print("Meilleurs hyperparamètres:", study.best_params)
-    
-    # Entraînement final avec les meilleurs hyperparamètres
-    best_params = study.best_params
-    vec_env = make_vec_env(lambda: create_rlgym_env(), n_envs=4)
-    
-    policy_kwargs = dict(
-        features_extractor_class=CustomHybridExtractor,
-        features_extractor_kwargs=dict(features_dim=512),
-        activation_fn=nn.ReLU,
-    )
-    
-    agent = PPO(
-        "CnnPolicy",
-        vec_env,
-        policy_kwargs=policy_kwargs,
-        verbose=1,
-        learning_rate=best_params['learning_rate'],
-        n_steps=best_params['n_steps'],
-        batch_size=best_params['batch_size'],
-        gamma=best_params['gamma'],
-        ent_coef=best_params['ent_coef'],
-        tensorboard_log=log_dir
-    )
-    
-    # Entraîner l'agent
-    agent.learn(total_timesteps=200000, callback=None)  # Ajustez selon vos ressources
-    
-    # Sauvegarder le modèle
-    agent.save("ppo_rlgym_hybrid_agent")
-    
-    # Évaluer l'agent
-    mean_reward = evaluate_agent(agent, vec_env)
-    print(f"Récompense moyenne après entraînement: {mean_reward}")
-    
-    # Fermer l'environnement
-    vec_env.close()
-    
-    # Fermer TensorBoard
-    writer.close()
+    train_agent(num_episodes=500, max_timesteps=200, save_path="ppo_optimized_agent.pth")
 
 if __name__ == "__main__":
     main()
